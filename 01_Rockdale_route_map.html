@@ -26,6 +26,7 @@
   .legend-bar .dot{width:11px;height:11px;border-radius:50%;display:inline-block}
   .note{padding:10px 24px;font-size:12px;color:var(--muted);background:#F7F6FE}
   .info-bar{padding:10px 24px;font-size:13px;color:var(--ink);background:#fff;border-bottom:1px solid var(--hair)}
+  .vtag{display:inline-block;background:var(--navy2);color:#fff;font-family:'Oswald',sans-serif;font-size:11px;font-weight:600;padding:2px 7px;border-radius:5px;margin-left:2px;letter-spacing:0.3px}
   .stop-icon{background:#fff;border:2px solid #3D71B8;border-radius:50%;width:9px;height:9px}
   .end-icon{border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-size:11px;font-weight:700;font-family:'Oswald',sans-serif;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.4)}
   .arrow-icon{color:#12233F;font-size:15px;line-height:1;opacity:0.95;text-shadow:0 0 2px #fff,0 0 2px #fff}
@@ -52,8 +53,9 @@
 </header>
 <div class="legend-bar">
   <span><i style="background:#3D71B8"></i>Regular</span>
-  <span><i style="background:#00ACEF"></i>Sub &mdash; year-round</span>
-  <span><i style="background:#E6007E"></i>Diversion or extension &mdash; school term only</span>
+  <span><i style="background:#F7901E"></i>Extension only &mdash; same road, goes further</span>
+  <span><i style="background:#8E44AD"></i>Short working &mdash; same road, starts/ends partway</span>
+  <span><i style="background:#E6007E"></i>Diversion (may also extend) &mdash; different streets somewhere along the way</span>
   <span><span class="dot" style="background:#1E8E3E"></span>Start</span>
   <span><span class="dot" style="background:#C0392B"></span>End</span>
   <span><span class="dot" style="background:#fff;border:2px solid #3D71B8"></span>Bus stop</span>
@@ -92,10 +94,112 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 
 let currentLayers = [];
 
-function colorFor(shape){
-  if(shape.is_base) return '#3D71B8';
-  if(shape.is_school) return '#E6007E';
-  return '#00ACEF';
+// Diversion (different streets somewhere along the way) and extension (covers
+// more ground than base, either before pickup or after dropoff) are independent,
+// not mutually exclusive -- a trip can do any combination of these at once.
+// Walk through base's stops in order and, for each one, find where (if at
+// all) it appears in this shape's own stop list -- searching forward from
+// wherever the previous match left off, so results stay in order. This single
+// pass tells us everything: how much of base's A-B corridor this shape
+// actually covers, and where the covered range sits relative to base's own
+// start/end -- so short working, extension, and diversion can all be detected
+// together and combined (e.g. a trip can be short at one end and extended at
+// the other, or short with a diversion inside the part it does run).
+function classifyVariant(shape, shapesList){
+  if(shape.is_base) return {base:true};
+  const base = shapesList.find(s=>s.is_base);
+  if(!base) return {diversion:true};
+  const bNames = base.stops.map(s=>s.name), sNames = shape.stops.map(s=>s.name);
+
+  let si = 0;
+  const baseCoverage = []; // shape-index where each base stop was found, or -1
+  for(let bi=0; bi<bNames.length; bi++){
+    let found = -1;
+    for(let k=si; k<sNames.length; k++){
+      if(sNames[k] === bNames[bi]){ found = k; break; }
+    }
+    if(found !== -1) si = found + 1;
+    baseCoverage.push(found);
+  }
+
+  const coveredBaseIdx = [];
+  for(let bi=0; bi<baseCoverage.length; bi++){ if(baseCoverage[bi] !== -1) coveredBaseIdx.push(bi); }
+  if(coveredBaseIdx.length === 0) return {diversion:true, extension:false, short:false};
+
+  const firstBaseIdx = coveredBaseIdx[0], lastBaseIdx = coveredBaseIdx[coveredBaseIdx.length-1];
+
+  // Within the range this shape does cover, did it skip any base stop, or
+  // squeeze extra (non-base) stops in between two consecutive base stops?
+  // Either means it took different streets somewhere inside its own range.
+  let skippedWithinRange = false;
+  for(let bi=firstBaseIdx; bi<=lastBaseIdx; bi++){ if(baseCoverage[bi] === -1){ skippedWithinRange = true; break; } }
+  const shapeIdxOfCovered = coveredBaseIdx.map(bi=>baseCoverage[bi]);
+  let hasInternalGap = false;
+  for(let i=0;i<shapeIdxOfCovered.length-1;i++){ if(shapeIdxOfCovered[i+1]-shapeIdxOfCovered[i] > 1){ hasInternalGap = true; break; } }
+  const hasDiversion = skippedWithinRange || hasInternalGap;
+
+  const startsAtBaseStart = firstBaseIdx === 0;
+  const endsAtBaseEnd = lastBaseIdx === bNames.length - 1;
+  const leadingExtra = shapeIdxOfCovered[0] > 0;
+  const trailingExtra = shapeIdxOfCovered[shapeIdxOfCovered.length-1] < sNames.length - 1;
+  const extendedStart = startsAtBaseStart && leadingExtra;
+  const extendedEnd = endsAtBaseEnd && trailingExtra;
+  const truncatedStart = !startsAtBaseStart;
+  const truncatedEnd = !endsAtBaseEnd;
+
+  // A short working can still have its own detour tacked onto the truncated
+  // end: e.g. instead of just stopping partway through base's route, it peels
+  // off onto streets base never uses at all before terminating. That's a
+  // genuine diversion riding on top of the short working, not just a shorter
+  // version of the same path.
+  const leadingDetour = truncatedStart && leadingExtra;
+  const trailingDetour = truncatedEnd && trailingExtra;
+
+  return {
+    diversion: hasDiversion || leadingDetour || trailingDetour,
+    extension: extendedStart || extendedEnd, extendedStart, extendedEnd,
+    short: truncatedStart || truncatedEnd, truncatedStart, truncatedEnd
+  };
+}
+function variantLabel(v){
+  if(v.base) return 'REGULAR';
+  // Top tier is REGULAR (covers base's full A-to-B range) vs SHORT WORKING
+  // (only part of it) -- symmetric names, since both can independently pick
+  // up a DIVERSION and/or EXTENSION modifier.
+  const tier = v.short ? null : 'REGULAR';
+  const parts = [];
+  if(v.diversion) parts.push('DIVERSION');
+  if(v.extension){
+    if(v.extendedStart && v.extendedEnd) parts.push('EXTENSION (both ends)');
+    else if(v.extendedStart) parts.push('EXTENSION (extra stops before pickup)');
+    else parts.push('EXTENSION (extra stops after dropoff)');
+  }
+  if(v.short){
+    if(v.truncatedStart && v.truncatedEnd) parts.push('SHORT WORKING (both ends)');
+    else if(v.truncatedStart) parts.push('SHORT WORKING (starts partway, joins base late)');
+    else if(v.truncatedEnd) parts.push('SHORT WORKING (ends early)');
+    else parts.push('SHORT WORKING');
+  }
+  if(tier && parts.length===0) return tier;
+  if(tier) return tier + ' + ' + parts.join(' + ');
+  return parts.join(' + ');
+}
+// Short-form tag for map labels: R=regular, S=short working, D=diversion,
+// E=extension. Full meanings are explained on the homepage, not repeated here.
+function variantAbbrev(v){
+  if(v.base) return 'R';
+  const codes = [];
+  codes.push(v.short ? 'S' : 'R');
+  if(v.diversion) codes.push('D');
+  if(v.extension) codes.push('E');
+  return codes.join('+');
+}
+function colorFor(v){
+  if(v.base) return '#3D71B8';
+  if(v.diversion) return '#E6007E';
+  if(v.extension) return '#F7901E';
+  if(v.short) return '#8E44AD';
+  return '#3D71B8'; // identical to base in every way that matters -- treat as regular, not diversion
 }
 
 function dirLabel(dirKey, shapesList){
@@ -161,12 +265,32 @@ function updateDepartures(){
 
   let allDeps = [];
   filtered.forEach(s=>{
-    s.departures.forEach(d=> allDeps.push({...d, shape_id:s.shape_id, is_base:s.is_base, is_school:s.is_school}));
+    s.departures.forEach(d=> allDeps.push({...d, shape_id:s.shape_id, is_base:s.is_base, is_school:s.is_school, stops:s.stops||[], headsign:s.headsign}));
   });
   allDeps.sort((a,b)=> a.departure.localeCompare(b.departure));
 
+  // Two different trips can legitimately depart at the exact same time (e.g. one
+  // diversion goes via a different street than another). Tag each with a stop
+  // that's unique to its own path so the dropdown doesn't show identical-looking
+  // duplicate entries a driver has no way to tell apart.
+  const byTime = {};
+  allDeps.forEach(d => { (byTime[d.departure] = byTime[d.departure] || []).push(d); });
+  Object.values(byTime).forEach(group=>{
+    if(group.length < 2) return;
+    group.forEach((d, i)=>{
+      const others = group.filter((x,j)=>j!==i);
+      let uniqueStop = null;
+      for(const st of d.stops){
+        if(others.every(o => !o.stops.some(os=>os.name===st.name))){ uniqueStop = st.name; break; }
+      }
+      d.viaTag = uniqueStop ? ` — via ${uniqueStop}` : ` (variant ${i+1} of ${group.length})`;
+    });
+  });
+
   depSel.innerHTML = '<option value="">(all times &mdash; show every path)</option>' +
-    allDeps.map(d=>`<option value="${d.trip_id}">${d.departure} ${d.is_base?'(regular)':(d.is_school?'(school term)':'(diversion/extension)')}</option>`).join('');
+    allDeps.map(d=>
+      `<option value="${d.trip_id}">${d.departure} &mdash; ${d.headsign}${d.viaTag||''}</option>`
+    ).join('');
   render();
 }
 
@@ -212,7 +336,13 @@ function render(){
   if(filtered.length===0){
     infoBar.textContent = 'No matching paths for this selection.';
   } else {
-    infoBar.textContent = `Showing ${filtered.length} path(s) for route ${route}, ${dirSel.selectedOptions[0]?dirSel.selectedOptions[0].text.replace(/&mdash;/,'—'):''}.`;
+    const headsigns = [...new Set(filtered.map(s=>s.headsign))];
+    const headsignText = headsigns.length===1
+      ? `Actual destination: <b>${headsigns[0]}</b>`
+      : `Destinations shown: <b>${headsigns.join(' / ')}</b>`;
+    const tags = [...new Set(filtered.map(s=>variantAbbrev(classifyVariant(s, shapesList))))];
+    const tagText = tags.map(t=>`<span class="vtag">${t}</span>`).join(' ');
+    infoBar.innerHTML = `Showing ${filtered.length} path(s) for route ${route}, ${dirSel.selectedOptions[0]?dirSel.selectedOptions[0].text.replace(/&mdash;/,'—'):''}. ${headsignText} ${tagText}`;
   }
 
   const subs = filtered.filter(s=>!s.is_base);
@@ -220,12 +350,15 @@ function render(){
 
   [...subs, ...bases].forEach(shape=>{
     const latlngs = shape.path.map(p=>[p[0],p[1]]);
-    const color = colorFor(shape);
-    const weight = shape.is_base ? 4 : 3;
-    const dash = shape.is_base ? null : '8 6';
+    const variantType = classifyVariant(shape, shapesList);
+    const color = colorFor(variantType);
+    const isEffectivelyRegular = variantType.base || (!variantType.diversion && !variantType.extension && !variantType.short);
+    const weight = isEffectivelyRegular ? 4 : 3;
+    const dash = isEffectivelyRegular ? null : '8 6';
     const poly = L.polyline(latlngs, {color, weight, dashArray:dash, opacity:0.85}).addTo(map);
     const depTimes = shape.departures.map(d=>d.departure).join(', ');
-    poly.bindTooltip(`${shape.is_base?'REGULAR':(shape.is_school?'DIVERSION/EXTENSION (school term)':'DIVERSION/EXTENSION (year-round)')} &mdash; ${shape.trips} trip(s)<br>Departures: ${depTimes}<br>To: ${shape.headsign}`);
+    const schoolTag = shape.is_school ? ' (school term)' : '';
+    poly.bindTooltip(`[${variantAbbrev(variantType)}]${schoolTag} &mdash; ${shape.trips} trip(s)<br>Departures: ${depTimes}<br>To: ${shape.headsign}`);
     currentLayers.push(poly);
 
     const arrowMarkers = addDirectionArrows(latlngs, color);
